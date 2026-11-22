@@ -28,6 +28,7 @@
 /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
 
 #include "qemu/osdep.h"
+#include "block/chd-disc.h"
 #include "qemu/module.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
@@ -1458,8 +1459,11 @@ void xemu_load_disc(const char *path, Error **errp)
     xbox_smc_eject_button();
     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
 
-    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
-                               false, 0, &error);
+    // A CHD (chdman's compressed image) is read by the chd driver; the boot
+    // drive has no format, so the block layer finds it there by its header
+    qmp_blockdev_change_medium("ide0-cd1", NULL, path,
+                               chd_disc_path_is_chd(path) ? "chd" : "raw",
+                               false, false, false, 0, &error);
     if (error) {
         error_propagate(errp, error);
     } else {
