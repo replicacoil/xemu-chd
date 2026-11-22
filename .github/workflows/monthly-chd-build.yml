@@ -1,0 +1,286 @@
+name: Monthly standalone CHD build
+
+# For a repository that holds xemu's code: a fork of xemu-project/xemu, or one
+# that is not a fork (an account that has a fork of a fork of xemu already can
+# not fork it again: GitHub allows one fork per fork network). On the 1st of
+# every month (04:23 UTC), and whenever it is run by hand:
+#
+#   1. master is made identical to xemu-project/xemu's master (and made, in a
+#      repository that has none yet: the first run pushes all of xemu's history);
+#   2. chd-support is made again: that master, with the pull request's current
+#      head merged into it (2809, CHD support, unless the run says another).
+#      It is made again, not merged forward as the libretro fork's is: the pull
+#      request is somebody else's, who may rebase or force-push it, and a branch
+#      that remade each month can not collect the debris of that;
+#   3. libchdr is linked into the block layer, if the pull request does not
+#      (it does not, at the time of writing: see the step of that name);
+#   4. chd-support is built for Windows x86_64, release, as upstream builds it
+#      (build-windows.yml), and the build is the run's artifact.
+#
+# This file lives on a branch of its own, which has to be the repository's
+# default branch (scheduled workflows run from there only): step 1 would delete
+# it from master, and step 2 from chd-support. Make it so, in a new empty
+# repository on GitHub (no README, no licence), whose default branch will be
+# the first one pushed:
+#
+#   git init -b automation && mkdir -p .github/workflows
+#   cp <this file> .github/workflows/monthly-chd-build.yml
+#   git add .github && git commit -m "Monthly CHD build [skip ci]"
+#   git remote add origin https://github.com/<you>/<repository>.git
+#   git push -u origin automation
+#
+# (In a fork, make the same branch from a clone and make it the default branch
+# in Settings > General.)
+#
+# Also needed once: a personal access token in the secret SYNC_TOKEN (Settings >
+# Secrets and variables > Actions), as the job's own token may not push a commit
+# that changes .github/workflows, which a merge of master does sooner or later.
+# A fine-grained token for this repository, with Contents and Workflows set to
+# Read and write, is enough.
+#
+# A pull request that does not merge into master stops the job, with the files
+# in the run's summary, and GitHub mails the failed run. The commits of
+# chd-support end in [skip ci], so that upstream's own CI (every platform and
+# its tests, which it runs on every push to a branch) does not start on them.
+
+on:
+  schedule:
+    - cron: '23 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Number of the xemu pull request to build on top of master'
+        type: string
+        default: '2809'
+      build:
+        description: 'Build chd-support after making it'
+        type: boolean
+        default: true
+
+concurrency:
+  group: monthly-chd-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # the pushes use SYNC_TOKEN
+
+env:
+  UPSTREAM_REPO: xemu-project/xemu
+  UPSTREAM_BRANCH: master
+  MIRROR_BRANCH: master
+  FEATURE_BRANCH: chd-support
+  # Where upstream's Windows build gets its image from, and the image to use if
+  # that line is not found there any more
+  IMAGE_FILE: .github/workflows/build-windows.yml
+  FALLBACK_IMAGE: ghcr.io/xemu-project/xemu-win64-toolchain-gcc:sha-2881edd
+
+jobs:
+  sync:
+    name: Sync master and make chd-support
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Check that SYNC_TOKEN is set
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error title=SYNC_TOKEN is not set::Add a personal access token (Contents and Workflows: read and write, for this repository) as the repository secret SYNC_TOKEN."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fetch upstream and the pull request
+        env:
+          PR: ${{ inputs.pr || '2809' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --no-tags upstream "+refs/pull/${PR}/head:refs/remotes/upstream/pr-${PR}"
+
+      - name: Make the mirror branch identical to upstream
+        run: |
+          up=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          # a repository that is not a fork has no mirror branch until this step makes it
+          mine=$(git rev-parse --verify --quiet "origin/${MIRROR_BRANCH}" || true)
+          {
+            echo "### ${MIRROR_BRANCH}"
+            echo "${UPSTREAM_REPO} ${UPSTREAM_BRANCH} is at \`${up:0:10}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$up" = "$mine" ]; then
+            echo "${MIRROR_BRANCH} is already identical." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Commits of the fork's own on the mirror go with the reset: say which
+          if [ -n "$mine" ] && [ "$(git rev-list --count "$up..$mine")" != 0 ]; then
+            echo "::warning title=${MIRROR_BRANCH} had commits that upstream does not have::They are replaced; the run's summary lists them."
+            {
+              echo
+              echo "Replaced (not in upstream), as \`git branch rescue <sha>\` can still bring them back for a while:"
+              git log --format='- %h %s' "$up..$mine"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git push --force origin "$up:refs/heads/${MIRROR_BRANCH}"
+          if [ -n "$mine" ]; then
+            echo "${MIRROR_BRANCH} was at \`${mine:0:10}\`, now at \`${up:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "${MIRROR_BRANCH} did not exist: made at \`${up:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Make the feature branch again, from master and the pull request
+        env:
+          PR: ${{ inputs.pr || '2809' }}
+        run: |
+          up=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          pr=$(git rev-parse "upstream/pr-${PR}")
+          git checkout -q -B "${FEATURE_BRANCH}" "$up"
+          echo "### ${FEATURE_BRANCH}" >> "$GITHUB_STEP_SUMMARY"
+          if git merge-base --is-ancestor "$pr" HEAD; then
+            # already in master (merged upstream since): the branch is master
+            git commit -q --allow-empty -m "${FEATURE_BRANCH}: master ${up:0:10}, which has pull request ${PR} (${pr:0:10}) already [skip ci]"
+            echo "Pull request ${PR} (\`${pr:0:10}\`) is in master already: ${FEATURE_BRANCH} is master \`${up:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
+          elif git merge --no-ff -m "${FEATURE_BRANCH}: master ${up:0:10} with pull request ${PR} (${pr:0:10}) [skip ci]" "$pr"; then
+            echo "Master \`${up:0:10}\` with pull request ${PR} \`${pr:0:10}\` merged: \`$(git rev-parse --short HEAD)\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            files=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            {
+              echo "**Pull request ${PR} (\`${pr:0:10}\`) does not merge into master \`${up:0:10}\`**: conflicts in"
+              echo '```'
+              echo "$files"
+              echo '```'
+              echo "${FEATURE_BRANCH} was left as it was."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Pull request ${PR} does not merge into master::Conflicts in: $(echo "$files" | tr '\n' ' ')"
+            exit 1
+          fi
+
+      # The pull request defines libchdr in meson.build and never links it into
+      # the block layer, so chd.c finds neither its header nor its library; its
+      # CMake options use the system zlib, which leaves out the miniz library
+      # that is linked here; and libchdr's codecs (lzma, miniz, zstd) are
+      # libraries of their own, which the static library does not carry. Each
+      # repair is made only if the pull request does not have it, so that a pull
+      # request that is fixed is taken as it is. Take this step out when it is.
+      - name: Link libchdr into the block layer
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          mb = pathlib.Path("meson.build")
+          bm = pathlib.Path("block/meson.build")
+          done = []
+
+          text = mb.read_text()
+          if "libchdr_sp" not in text:
+              # not the CHD pull request (the run was given another): nothing to link
+              print("the pull request does not use libchdr: nothing to repair")
+              raise SystemExit
+          if "'WITH_SYSTEM_ZLIB': 'ON'" in text:
+              text = text.replace("'WITH_SYSTEM_ZLIB': 'ON'", "'WITH_SYSTEM_ZLIB': 'OFF'")
+              done.append("WITH_SYSTEM_ZLIB off")
+          old = "libchdr = libchdr_sp.dependency('chdr-static')"
+          if old in text and "chdr-lzma" not in text:
+              new = ("# libchdr's CMake keeps its codecs in libraries of their own, which the\n"
+                     "  # static library does not carry\n"
+                     "  libchdr = declare_dependency(\n"
+                     "    link_with: [\n"
+                     "      libchdr_sp.target('chdr-static'),\n"
+                     "      libchdr_sp.target('chdr-lzma'),\n"
+                     "      libchdr_sp.target('miniz'),\n"
+                     "      libchdr_sp.target('zstd'),\n"
+                     "    ],\n"
+                     "    include_directories: libchdr_sp.include_directories('chdr-static'))")
+              text = text.replace(old, new)
+              done.append("libchdr dependency lists its targets")
+          mb.write_text(text)
+
+          b = bm.read_text()
+          if "libchdr" not in b:
+              if not b.endswith("\n"):
+                  b += "\n"
+              bm.write_text(b + "\n# CHD images need libchdr\nblock_ss.add(libchdr)\n")
+              done.append("block_ss links libchdr")
+
+          print("; ".join(done) if done else "nothing to repair")
+          PY
+          if git diff --quiet; then
+            echo "libchdr: the pull request links it already, nothing was repaired." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git commit -q -am "${FEATURE_BRANCH}: link libchdr into the block layer [skip ci]"
+            echo "libchdr was not linked by the pull request: repaired in \`$(git rev-parse --short HEAD)\` (meson.build, block/meson.build)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Push the feature branch
+        run: git push --force origin "HEAD:refs/heads/${FEATURE_BRANCH}"
+
+      - name: Find the toolchain image of upstream's Windows build
+        id: image
+        run: |
+          image=$(git show "upstream/${UPSTREAM_BRANCH}:${IMAGE_FILE}" 2>/dev/null \
+                  | sed -n "s/.*'-gcc:\(sha-[0-9a-f]*\)'.*/ghcr.io\/xemu-project\/xemu-win64-toolchain-gcc:\1/p" \
+                  | head -n 1)
+          if [ -z "$image" ]; then
+            echo "::warning title=No toolchain image found in ${IMAGE_FILE}::Using ${FALLBACK_IMAGE}."
+            image="$FALLBACK_IMAGE"
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Windows toolchain image: \`${image}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build chd-support for Windows x86_64
+    needs: sync
+    if: github.event_name != 'workflow_dispatch' || inputs.build
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.sync.outputs.image }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CROSSPREFIX: x86_64-w64-mingw32.static-
+      CROSSAR: x86_64-w64-mingw32.static-gcc-ar
+    steps:
+      # build.sh downloads some of what it needs, and the image has no curl
+      - name: Install curl
+        run: |
+          apt-get update
+          apt-get install -qy curl
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0
+          submodules: false
+
+      - name: Mark the checkout safe for git, and fetch upstream's tags
+        run: |
+          git config --global --add safe.directory '*'
+          # for the version string (git describe): the fork has no tags of its own
+          git fetch --no-recurse-submodules "https://github.com/${UPSTREAM_REPO}.git" 'refs/tags/v*:refs/tags/v*'
+
+      # As upstream's release build, without the compiler cache its incremental
+      # LTO uses (a cache that would be gone by the next month)
+      - name: Compile
+        run: ./build.sh -p win64-cross -Db_lto=true -Dx86_version=3
+
+      - name: Say what was built
+        run: |
+          {
+            echo "### Build"
+            echo "xemu \`$(git describe --tags --match 'v*' 2>/dev/null || echo unknown)\`, commit \`$(git rev-parse --short HEAD)\`"
+            echo
+            echo "The artifact is \`dist\`: xemu.exe, to be run with the usual BIOS files. Its CHD support is the pull request's: a CHD made with \`chdman createcd\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xemu-windows-x86_64-release-chd-support
+          path: dist
