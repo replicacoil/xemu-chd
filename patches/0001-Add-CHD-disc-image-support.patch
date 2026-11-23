@@ -1,0 +1,1267 @@
+From 508b2ab67ae3a1475504832d6184f6a527a5de23 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 14:24:48 +0000
+Subject: [PATCH] Add CHD disc image support
+
+Load Xbox disc images stored as MAME CHD (chdman createdvd, or createcd with
+one data track), read compressed through libchdr as the game runs.
+
+- block/chd.c: a read-only block driver for the DVD drive. libchdr reads
+  through the driver's file child, in windows of the file, and decodes on the
+  thread pool, so the main loop and the lock the emulated CPU needs are not
+  held while a hunk is decompressed; 16 MiB of decoded hunks are kept.
+- block/chd-disc.c: the disc's layout in a CHD, with no QEMU in it: chdman's
+  DVD layout (flat 2048-byte units) and a CD's (MODE1 or MODE1_RAW track).
+- libchdr as a static CMake subproject (miniz, lzma and zstd come with it).
+- ui: xemu_load_disc opens a .chd with the chd driver (the boot drive has no
+  format, and finds it by its header); the file dialog and the games list
+  take .chd.
+
+Based on the block driver of pull request 2809, reworked.
+---
+ block/chd-disc.c         | 479 ++++++++++++++++++++++++++++++++++++
+ block/chd.c              | 515 +++++++++++++++++++++++++++++++++++++++
+ block/meson.build        |   6 +
+ include/block/chd-disc.h |  95 ++++++++
+ meson.build              |  30 +++
+ subprojects/libchdr.wrap |   4 +
+ ui/xemu.c                |   8 +-
+ ui/xui/actions.cc        |   2 +-
+ ui/xui/popup-menu.cc     |   3 +-
+ 9 files changed, 1138 insertions(+), 4 deletions(-)
+ create mode 100644 block/chd-disc.c
+ create mode 100644 block/chd.c
+ create mode 100644 include/block/chd-disc.h
+ create mode 100644 subprojects/libchdr.wrap
+
+diff --git a/block/chd-disc.c b/block/chd-disc.c
+new file mode 100644
+index 0000000..56bfffd
+--- /dev/null
++++ b/block/chd-disc.c
+@@ -0,0 +1,479 @@
++/*
++ * CHD (MAME's Compressed Hunks of Data) disc images, read through libchdr:
++ * the layout of the disc in a CHD. See include/block/chd-disc.h.
++ *
++ * Based on the CD-ROM reading of block/chd.c in xemu-project/xemu pull
++ * request 2809, made independent of QEMU's block layer and extended with the
++ * DVD layout of chdman's createdvd.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include <inttypes.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <libchdr/chd.h>
++#include <libchdr/cdrom.h>
++
++#include "block/chd-disc.h"
++
++/* The data of a MODE1_RAW sector follows its sync (12 bytes) and header (4) */
++#define CD_RAW_DATA_OFFSET 16
++
++/* The tracks of a CD, in the order of its metadata; none with a pregap */
++typedef struct ChdTrack {
++    uint64_t first_lba;     /* of the disc's 2048-byte sectors */
++    uint64_t frames;
++    uint64_t chd_frame;     /* the CHD's frame that is its first */
++    uint32_t data_offset;   /* of the 2048 bytes in a frame */
++} ChdTrack;
++
++/* The decoded hunks kept: 16 MiB, whatever the hunk size */
++#define CHD_CACHE_BYTES (16u * 1024 * 1024)
++
++struct ChdDisc {
++    chd_file *chd;
++    /*
++     * The decoded hunks kept, direct-mapped: hunk h lives in slot h % nslots,
++     * and cache_hunk[slot] says which hunk that is (-1 for none). A disc is
++     * read mostly in order, which this keeps whole, and two streams only
++     * disturb each other where their hunks meet in a slot.
++     */
++    uint8_t *cache;
++    int64_t *cache_hunk;
++    uint32_t nslots;        /* a power of two */
++    uint32_t hunkbytes;
++    bool dvd;               /* flat 2048-byte units, else a CD's frames */
++    uint32_t frames_per_hunk;
++    ChdTrack *tracks;
++    unsigned num_tracks;
++    uint64_t sectors;
++};
++
++#ifdef __GNUC__
++__attribute__((format(printf, 3, 4)))
++#endif
++static void set_err(char *err, size_t errlen, const char *fmt, ...)
++{
++    va_list ap;
++
++    if (!err || !errlen) {
++        return;
++    }
++    va_start(ap, fmt);
++    vsnprintf(err, errlen, fmt, ap);
++    va_end(ap);
++}
++
++/*
++ * The metadata of track index: CHT2, or CHTR in older CHDs. The strings are
++ * read with a width, as libchdr's own formats read them without one and the
++ * metadata is the file's. 1 for a track, 0 for no more, -1 for metadata that
++ * does not read.
++ */
++static int read_track_metadata(chd_file *chd, unsigned index, int *tkid,
++                               char type[32], char subtype[32], int *frames,
++                               int *pregap, int *postgap)
++{
++    char text[512] = { 0 };
++    char pgtype[32] = { 0 }, pgsub[32] = { 0 };
++    uint32_t len, tag;
++    uint8_t flags;
++    int n;
++
++    type[0] = subtype[0] = 0;
++    *tkid = -1;
++    *frames = 0;
++    *pregap = *postgap = 0;
++
++    if (chd_get_metadata(chd, CDROM_TRACK_METADATA2_TAG, index, text,
++                         sizeof(text) - 1, &len, &tag, &flags) == CHDERR_NONE) {
++        n = sscanf(text,
++                   "TRACK:%d TYPE:%31s SUBTYPE:%31s FRAMES:%d PREGAP:%d "
++                   "PGTYPE:%31s PGSUB:%31s POSTGAP:%d",
++                   tkid, type, subtype, frames, pregap, pgtype, pgsub,
++                   postgap);
++        return n >= 4 ? 1 : -1;
++    }
++    if (chd_get_metadata(chd, CDROM_TRACK_METADATA_TAG, index, text,
++                         sizeof(text) - 1, &len, &tag, &flags) == CHDERR_NONE) {
++        n = sscanf(text, "TRACK:%d TYPE:%31s SUBTYPE:%31s FRAMES:%d", tkid,
++                   type, subtype, frames);
++        return n >= 4 ? 1 : -1;
++    }
++    return 0;
++}
++
++/* The bytes per sector and where the data is in one, 0 for a type that is not
++ * MODE1 */
++static uint32_t track_sector_size(const char *type, uint32_t *data_offset)
++{
++    if (!strcmp(type, "MODE1") || !strcmp(type, "MODE1/2048")) {
++        *data_offset = 0;
++        return 2048;
++    }
++    if (!strcmp(type, "MODE1_RAW") || !strcmp(type, "MODE1/2352")) {
++        *data_offset = CD_RAW_DATA_OFFSET;
++        return 2352;
++    }
++    return 0;
++}
++
++static bool read_cd_tracks(ChdDisc *d, char *err, size_t errlen)
++{
++    uint64_t total = 0, chd_frame = 0;
++
++    for (;;) {
++        char type[32], subtype[32];
++        int tkid, frames, pregap, postgap;
++        uint32_t data_offset = 0;
++        ChdTrack *tr, *grown;
++        int r = read_track_metadata(d->chd, d->num_tracks, &tkid, type,
++                                    subtype, &frames, &pregap, &postgap);
++
++        if (r == 0) {
++            break;
++        }
++        if (r < 0) {
++            set_err(err, errlen, "invalid CD track metadata");
++            return false;
++        }
++        if (d->num_tracks >= CD_MAX_TRACKS) {
++            set_err(err, errlen, "too many tracks");
++            return false;
++        }
++        if (strcmp(subtype, "NONE") != 0 || pregap != 0 || postgap != 0) {
++            set_err(err, errlen,
++                    "track pregap/postgap/subtypes are not supported");
++            return false;
++        }
++        if (tkid != (int)d->num_tracks + 1) {
++            set_err(err, errlen, "unexpected track numbering");
++            return false;
++        }
++        if (!strcmp(type, "AUDIO")) {
++            set_err(err, errlen, "audio tracks are not supported for DVD-ROM");
++            return false;
++        }
++        if (!track_sector_size(type, &data_offset)) {
++            set_err(err, errlen, "unsupported track type '%s'", type);
++            return false;
++        }
++        if (frames <= 0) {
++            set_err(err, errlen, "empty track");
++            return false;
++        }
++
++        grown = realloc(d->tracks, (d->num_tracks + 1) * sizeof(*d->tracks));
++        if (!grown) {
++            set_err(err, errlen, "out of memory");
++            return false;
++        }
++        d->tracks = grown;
++        tr = &d->tracks[d->num_tracks++];
++        tr->first_lba = total;
++        tr->frames = frames;
++        tr->chd_frame = chd_frame;
++        tr->data_offset = data_offset;
++
++        total += frames;
++        /* chdman pads each track to a multiple of CD_TRACK_PADDING frames */
++        chd_frame += (uint64_t)((frames + CD_TRACK_PADDING - 1) /
++                                CD_TRACK_PADDING) * CD_TRACK_PADDING;
++    }
++
++    d->sectors = total;
++    return true;
++}
++
++ChdDisc *chd_disc_new(chd_file *chd, char *err, size_t errlen)
++{
++    const chd_header *hdr = chd_get_header(chd);
++    ChdDisc *d;
++
++    if (!hdr || hdr->hunkbytes == 0) {
++        set_err(err, errlen, "invalid CHD header");
++        return NULL;
++    }
++    d = calloc(1, sizeof(*d));
++    if (!d) {
++        set_err(err, errlen, "out of memory");
++        return NULL;
++    }
++    d->chd = chd;
++    d->hunkbytes = hdr->hunkbytes;
++
++    if (!read_cd_tracks(d, err, errlen)) {
++        goto fail;
++    }
++
++    if (d->num_tracks) {
++        /* a CD: its hunks hold whole frames */
++        uint64_t frames;
++
++        if (d->hunkbytes % CD_FRAME_SIZE) {
++            set_err(err, errlen, "invalid hunk size for a CD-ROM");
++            goto fail;
++        }
++        d->frames_per_hunk = d->hunkbytes / CD_FRAME_SIZE;
++        d->sectors = d->tracks[d->num_tracks - 1].first_lba +
++                     d->tracks[d->num_tracks - 1].frames;
++        frames = d->tracks[d->num_tracks - 1].chd_frame +
++                 d->tracks[d->num_tracks - 1].frames;
++        if (frames > (uint64_t)hdr->totalhunks * d->frames_per_hunk) {
++            set_err(err, errlen, "the CHD has fewer frames than its tracks");
++            goto fail;
++        }
++    } else if (hdr->unitbytes == CHD_DISC_SECTOR_SIZE &&
++               d->hunkbytes % CHD_DISC_SECTOR_SIZE == 0) {
++        /* chdman createdvd: the sectors, one after the other */
++        d->dvd = true;
++        d->sectors = hdr->logicalbytes / CHD_DISC_SECTOR_SIZE;
++        if (d->sectors > (uint64_t)hdr->totalhunks * d->hunkbytes /
++                         CHD_DISC_SECTOR_SIZE) {
++            set_err(err, errlen, "the CHD is shorter than its size says");
++            goto fail;
++        }
++    } else {
++        set_err(err, errlen,
++                "not a CD-ROM or DVD CHD (no tracks, and not 2048-byte units)");
++        goto fail;
++    }
++
++    if (d->sectors == 0) {
++        set_err(err, errlen, "empty CHD image");
++        goto fail;
++    }
++    d->nslots = 4;
++    while (d->nslots < 8192 &&
++           (uint64_t)d->nslots * 2 * d->hunkbytes <= CHD_CACHE_BYTES) {
++        d->nslots *= 2;
++    }
++    d->cache = malloc((size_t)d->nslots * d->hunkbytes);
++    d->cache_hunk = malloc(d->nslots * sizeof(*d->cache_hunk));
++    if (!d->cache || !d->cache_hunk) {
++        set_err(err, errlen, "out of memory");
++        goto fail;
++    }
++    for (uint32_t i = 0; i < d->nslots; i++) {
++        d->cache_hunk[i] = -1;
++    }
++    return d;
++
++fail:
++    free(d->cache);
++    free(d->cache_hunk);
++    free(d->tracks);
++    free(d);
++    return NULL;
++}
++
++void chd_disc_free(ChdDisc *d)
++{
++    if (!d) {
++        return;
++    }
++    free(d->cache);
++    free(d->cache_hunk);
++    free(d->tracks);
++    free(d);
++}
++
++uint64_t chd_disc_sectors(const ChdDisc *d)
++{
++    return d->sectors;
++}
++
++/* Where sector lba is: the hunk, and the offset of its 2048 bytes in it */
++static bool locate_sector(ChdDisc *d, uint64_t lba, uint64_t *hunk,
++                          size_t *offset, char *err, size_t errlen)
++{
++    if (lba >= d->sectors) {
++        set_err(err, errlen, "LBA %" PRIu64 " out of range", lba);
++        return false;
++    }
++
++    if (d->dvd) {
++        uint64_t byte = lba * CHD_DISC_SECTOR_SIZE;
++
++        *hunk = byte / d->hunkbytes;
++        *offset = byte % d->hunkbytes;
++    } else {
++        const ChdTrack *tr = NULL;
++        uint64_t frame;
++        unsigned i;
++
++        for (i = 0; i < d->num_tracks; i++) {
++            if (lba >= d->tracks[i].first_lba &&
++                lba < d->tracks[i].first_lba + d->tracks[i].frames) {
++                tr = &d->tracks[i];
++                break;
++            }
++        }
++        if (!tr) {
++            set_err(err, errlen, "LBA %" PRIu64 " is in no track", lba);
++            return false;
++        }
++        frame = tr->chd_frame + (lba - tr->first_lba);
++        *hunk = frame / d->frames_per_hunk;
++        *offset = (frame % d->frames_per_hunk) * CD_FRAME_SIZE +
++                  tr->data_offset;
++    }
++    return true;
++}
++
++static uint8_t *hunk_slot(ChdDisc *d, uint64_t hunk)
++{
++    return d->cache + (size_t)(hunk & (d->nslots - 1)) * d->hunkbytes;
++}
++
++const uint8_t *chd_disc_sector_cached(ChdDisc *d, uint64_t lba)
++{
++    uint64_t hunk;
++    size_t offset;
++
++    if (!locate_sector(d, lba, &hunk, &offset, NULL, 0) ||
++        d->cache_hunk[hunk & (d->nslots - 1)] != (int64_t)hunk) {
++        return NULL;
++    }
++    return hunk_slot(d, hunk) + offset;
++}
++
++const uint8_t *chd_disc_sector(ChdDisc *d, uint64_t lba, char *err,
++                               size_t errlen)
++{
++    uint64_t hunk;
++    size_t offset;
++    uint32_t slot;
++
++    if (!locate_sector(d, lba, &hunk, &offset, err, errlen)) {
++        return NULL;
++    }
++    slot = hunk & (d->nslots - 1);
++    if (d->cache_hunk[slot] != (int64_t)hunk) {
++        chd_error cerr;
++
++        d->cache_hunk[slot] = -1;
++        cerr = chd_read(d->chd, (uint32_t)hunk, hunk_slot(d, hunk));
++        if (cerr != CHDERR_NONE) {
++            set_err(err, errlen, "CHD read failed: %s", chd_error_string(cerr));
++            return NULL;
++        }
++        d->cache_hunk[slot] = (int64_t)hunk;
++    }
++    return hunk_slot(d, hunk) + offset;
++}
++
++bool chd_disc_path_is_chd(const char *path)
++{
++    static const char ext[] = ".chd";
++    size_t len, i;
++
++    if (!path) {
++        return false;
++    }
++    len = strlen(path);
++    if (len < sizeof(ext) - 1) {
++        return false;
++    }
++    path += len - (sizeof(ext) - 1);
++    for (i = 0; i < sizeof(ext) - 1; i++) {
++        char c = path[i];
++
++        if (c >= 'A' && c <= 'Z') {
++            c += 'a' - 'A';
++        }
++        if (c != ext[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++struct ChdDiscFile {
++    chd_file *chd;
++    ChdDisc *disc;
++};
++
++ChdDiscFile *chd_disc_file_open(const char *path)
++{
++    ChdDiscFile *f;
++    char err[128];
++
++    /* libchdr reads a plain path; a URI is the frontend's VFS's */
++    if (!path || !path[0] || strstr(path, "://")) {
++        return NULL;
++    }
++    f = calloc(1, sizeof(*f));
++    if (!f) {
++        return NULL;
++    }
++    if (chd_open(path, CHD_OPEN_READ, NULL, &f->chd) != CHDERR_NONE) {
++        free(f);
++        return NULL;
++    }
++    f->disc = chd_disc_new(f->chd, err, sizeof(err));
++    if (!f->disc) {
++        chd_close(f->chd);
++        free(f);
++        return NULL;
++    }
++    return f;
++}
++
++bool chd_disc_file_read(ChdDiscFile *f, uint64_t offset, void *buf, size_t len)
++{
++    uint8_t *out = buf;
++    uint64_t size = chd_disc_sectors(f->disc) * CHD_DISC_SECTOR_SIZE;
++
++    if (offset > size || len > size - offset) {
++        return false;
++    }
++    while (len) {
++        uint64_t lba = offset / CHD_DISC_SECTOR_SIZE;
++        size_t skip = offset % CHD_DISC_SECTOR_SIZE;
++        size_t n = CHD_DISC_SECTOR_SIZE - skip;
++        const uint8_t *sector = chd_disc_sector(f->disc, lba, NULL, 0);
++
++        if (!sector) {
++            return false;
++        }
++        if (n > len) {
++            n = len;
++        }
++        memcpy(out, sector + skip, n);
++        out += n;
++        offset += n;
++        len -= n;
++    }
++    return true;
++}
++
++void chd_disc_file_close(ChdDiscFile *f)
++{
++    if (!f) {
++        return;
++    }
++    chd_disc_free(f->disc);
++    chd_close(f->chd);
++    free(f);
++}
+diff --git a/block/chd.c b/block/chd.c
+new file mode 100644
+index 0000000..0242d2e
+--- /dev/null
++++ b/block/chd.c
+@@ -0,0 +1,515 @@
++/*
++ * Block driver for MAME CHD disc images (via libchdr).
++ *
++ * Read-only, for the DVD drive: a CHD of a CD ("createcd") or of a DVD
++ * ("createdvd") shows as the disc's 2048-byte sectors. The layout is in
++ * chd-disc.c.
++ *
++ * Based on block/chd.c of xemu-project/xemu pull request 2809, which hands
++ * libchdr the file's host path. Here libchdr reads through the file child
++ * (libchdr's core file callbacks), so the image can be on any protocol, such
++ * as the saf:// of the libretro core, or a node of a json: description.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "block/block-io.h"
++#include "block/block_int.h"
++#include "block/chd-disc.h"
++#include "block/thread-pool.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++
++#include <libchdr/chd.h>
++
++/*
++ * What the driver does to keep a CHD as cheap to read as a plain image:
++ *
++ * - libchdr asks for one hunk's compressed bytes at a time, and a read of the
++ *   file child for each would be a round trip through the block layer per
++ *   hunk. ChdFile keeps windows of the file instead (64 KiB, doubling up to
++ *   1 MiB while the reads go on in order), which the hunks are cut from.
++ *   There are several, least recently used out first: a hunk that is a copy
++ *   of an earlier one (chdman stores every repeated hunk, the zeros of the
++ *   padding above all, as a reference) makes libchdr read the earlier one,
++ *   far back in the file, and the next hunk after it where it left off. With
++ *   one window, each such hunk would throw away the one the disc is being
++ *   read through, and take a seek.
++ * - Decoding is what costs, and in a coroutine it would hold the main loop,
++ *   and with it the big lock the emulated CPU needs for its device accesses.
++ *   It runs on the thread pool instead (chd_decode_job), as the file reads of
++ *   an ISO do. The thread may not call into the block layer, so it reads what
++ *   the window holds, and when it needs more it says so (-EAGAIN): the
++ *   coroutine reads that, and sends the job again.
++ * - The decoded hunks are kept (chd_disc_sector_cached), 16 MiB of them.
++ */
++#define CHD_WINDOW_MIN (64 * KiB)
++#define CHD_WINDOW_MAX (1 * MiB)
++
++/*
++ * libchdr's view of the file child: a position in it, as stdio has. It is
++ * freed by libchdr's fclose, which chd_open_core_file_callbacks also calls
++ * when it fails.
++ */
++#define CHD_WINDOWS 4
++
++typedef struct ChdWindow {
++    uint8_t *buf;
++    uint64_t pos;           /* the file's bytes pos .. pos + len are in buf */
++    size_t len;
++    size_t cap;
++    size_t want;            /* what the last refill took */
++    uint64_t used;          /* when it was last read, by ChdFile.clock */
++} ChdWindow;
++
++typedef struct ChdFile {
++    BdrvChild *child;
++    uint64_t size;
++    uint64_t pos;
++
++    ChdWindow win[CHD_WINDOWS];
++    uint64_t clock;
++
++    bool in_worker;         /* a thread-pool job reads: the windows only */
++    bool miss;              /* ... and wanted more: */
++    uint64_t miss_pos;
++    size_t miss_len;
++
++    uint64_t refills, refill_bytes;
++} ChdFile;
++
++typedef struct BDRVChdState {
++    CoMutex lock;
++    chd_file *chd;
++    ChdFile *file;          /* owned by chd */
++    ChdDisc *disc;
++
++    /* counters, logged when the image is closed */
++    uint64_t reads, bytes, jobs, retries, hits, slow;
++    int64_t read_ns, read_max_ns, decode_ns;
++} BDRVChdState;
++
++/* The window that holds bytes pos .. pos + bytes of the file, if there is one */
++static ChdWindow *chd_file_find(ChdFile *f, uint64_t pos, uint64_t bytes)
++{
++    for (int i = 0; i < CHD_WINDOWS; i++) {
++        ChdWindow *w = &f->win[i];
++
++        if (w->len && pos >= w->pos && pos + bytes <= w->pos + w->len) {
++            w->used = ++f->clock;
++            return w;
++        }
++    }
++    return NULL;
++}
++
++/*
++ * Reads the file at pos into a window, at least need bytes of it. From the
++ * main loop or a coroutine, with no job running.
++ */
++static int chd_file_fill(ChdFile *f, uint64_t pos, size_t need)
++{
++    ChdWindow *w = NULL;
++    size_t want;
++    int ret;
++
++    /* the reads go on in order, when this one starts in a window (a hunk's
++     * bytes run across its end) or just after it: that window takes more, as
++     * a readahead does */
++    for (int i = 0; i < CHD_WINDOWS; i++) {
++        ChdWindow *c = &f->win[i];
++
++        if (c->len && pos >= c->pos && pos <= c->pos + c->len + CHD_WINDOW_MIN) {
++            w = c;
++            break;
++        }
++    }
++    if (w) {
++        want = MIN(w->want * 2, CHD_WINDOW_MAX);
++    } else {
++        /* anywhere else is a read of another place: it takes the window
++         * that was read least recently, and little, so that a read at random
++         * stays cheap */
++        w = &f->win[0];
++        for (int i = 1; i < CHD_WINDOWS; i++) {
++            if (f->win[i].used < w->used) {
++                w = &f->win[i];
++            }
++        }
++        want = CHD_WINDOW_MIN;
++    }
++    w->want = want;
++    want = MAX(want, need);
++    if (want > w->cap) {
++        w->buf = g_realloc(w->buf, want);
++        w->cap = want;
++    }
++    want = MIN(want, f->size - pos);
++
++    w->len = 0;
++    ret = bdrv_pread(f->child, pos, want, w->buf, 0);
++    if (ret < 0) {
++        return ret;
++    }
++    w->pos = pos;
++    w->len = want;
++    w->used = ++f->clock;
++    f->refills++;
++    f->refill_bytes += want;
++    return 0;
++}
++
++/*
++ * The callbacks run from libchdr: in the open (the main loop), in a thread-pool
++ * job (the window only), and, for a read the window does not take, in a
++ * coroutine, with the graph read-locked: bdrv_pread works in either.
++ */
++static uint64_t chd_core_fsize(void *opaque)
++{
++    ChdFile *f = opaque;
++
++    return f->size;
++}
++
++static size_t chd_core_fread(void *ptr, size_t size, size_t nmemb,
++                             void *opaque)
++{
++    ChdFile *f = opaque;
++    ChdWindow *w;
++    uint64_t bytes;
++
++    if (!size || !nmemb || f->pos >= f->size) {
++        return 0;
++    }
++    /* as fread: whole items, and no more than the file has */
++    bytes = MIN((uint64_t)size * nmemb, f->size - f->pos);
++    nmemb = bytes / size;
++    bytes = (uint64_t)nmemb * size;
++    if (bytes == 0) {
++        return 0;
++    }
++
++    w = chd_file_find(f, f->pos, bytes);
++    if (!w) {
++        if (f->in_worker) {
++            f->miss = true;
++            f->miss_pos = f->pos;
++            f->miss_len = bytes;
++            return 0;
++        }
++        if (bytes > CHD_WINDOW_MAX) {
++            /* the map of the CHD, at the open: no use to keep */
++            if (bdrv_pread(f->child, f->pos, bytes, ptr, 0) < 0) {
++                return 0;
++            }
++            f->pos += bytes;
++            return nmemb;
++        }
++        if (chd_file_fill(f, f->pos, bytes) < 0) {
++            return 0;
++        }
++        w = chd_file_find(f, f->pos, bytes);
++        if (!w) {
++            return 0;
++        }
++    }
++    memcpy(ptr, w->buf + (f->pos - w->pos), bytes);
++    f->pos += bytes;
++    return nmemb;
++}
++
++static int chd_core_fseek(void *opaque, int64_t offset, int whence)
++{
++    ChdFile *f = opaque;
++    int64_t base;
++
++    switch (whence) {
++    case SEEK_SET:
++        base = 0;
++        break;
++    case SEEK_CUR:
++        base = f->pos;
++        break;
++    case SEEK_END:
++        base = f->size;
++        break;
++    default:
++        return -1;
++    }
++    if (offset < -base) {
++        return -1;
++    }
++    f->pos = base + offset;
++    return 0;
++}
++
++static int chd_core_fclose(void *opaque)
++{
++    ChdFile *f = opaque;
++
++    for (int i = 0; i < CHD_WINDOWS; i++) {
++        g_free(f->win[i].buf);
++    }
++    g_free(f);
++    return 0;
++}
++
++static const core_file_callbacks chd_core_callbacks = {
++    .fsize = chd_core_fsize,
++    .fread = chd_core_fread,
++    .fclose = chd_core_fclose,
++    .fseek = chd_core_fseek,
++};
++
++static int chd_probe(const uint8_t *buf, int buf_size, const char *filename)
++{
++    if (buf_size < 8 || memcmp(buf, "MComprHD", 8)) {
++        return 0;
++    }
++    return chd_disc_path_is_chd(filename) ? 100 : 10;
++}
++
++static int chd_bdrv_open(BlockDriverState *bs, QDict *options, int flags,
++                         Error **errp)
++{
++    BDRVChdState *s = bs->opaque;
++    ChdFile *file;
++    chd_error cerr;
++    char reason[128];
++    int64_t size;
++    int ret;
++
++    GLOBAL_STATE_CODE();
++
++    bdrv_graph_rdlock_main_loop();
++    ret = bdrv_apply_auto_read_only(bs, NULL, errp);
++    bdrv_graph_rdunlock_main_loop();
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = bdrv_open_file_child(NULL, options, "file", bs, errp);
++    if (ret < 0) {
++        return ret;
++    }
++
++    GRAPH_RDLOCK_GUARD_MAINLOOP();
++
++    size = bdrv_getlength(bs->file->bs);
++    if (size <= 0) {
++        error_setg(errp, "Could not get the size of the CHD file");
++        return size < 0 ? size : -EINVAL;
++    }
++
++    file = g_new0(ChdFile, 1);
++    file->child = bs->file;
++    file->size = size;
++
++    /* libchdr owns file now, and closes it if the open fails */
++    cerr = chd_open_core_file_callbacks(&chd_core_callbacks, file,
++                                        CHD_OPEN_READ, NULL, &s->chd);
++    if (cerr != CHDERR_NONE) {
++        s->chd = NULL;
++        error_setg(errp, "Could not open CHD: %s", chd_error_string(cerr));
++        return -EINVAL;
++    }
++    s->file = file;
++
++    s->disc = chd_disc_new(s->chd, reason, sizeof(reason));
++    if (!s->disc) {
++        error_setg(errp, "Unsupported CHD: %s", reason);
++        chd_close(s->chd);
++        s->chd = NULL;
++        s->file = NULL;
++        return -ENOTSUP;
++    }
++
++    bs->total_sectors = chd_disc_sectors(s->disc) *
++                        (CHD_DISC_SECTOR_SIZE / BDRV_SECTOR_SIZE);
++    qemu_co_mutex_init(&s->lock);
++    return 0;
++}
++
++static void chd_refresh_limits(BlockDriverState *bs, Error **errp)
++{
++    bs->bl.request_alignment = BDRV_SECTOR_SIZE;
++}
++
++typedef struct ChdDecodeJob {
++    BDRVChdState *s;
++    uint64_t lba;
++    const uint8_t *sector;
++    char reason[128];
++} ChdDecodeJob;
++
++/* On a thread-pool thread: decodes the hunk of job->lba, from the window */
++static int chd_decode_job(void *opaque)
++{
++    ChdDecodeJob *job = opaque;
++    BDRVChdState *s = job->s;
++    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    s->file->in_worker = true;
++    s->file->miss = false;
++    job->sector = chd_disc_sector(s->disc, job->lba, job->reason,
++                                  sizeof(job->reason));
++    s->file->in_worker = false;
++    s->decode_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
++
++    if (job->sector) {
++        return 0;
++    }
++    return s->file->miss ? -EAGAIN : -EIO;
++}
++
++/* The 2048 bytes of sector lba, decoded on the thread pool if they are not
++ * in the cache yet. With s->lock held. */
++static int coroutine_fn GRAPH_RDLOCK
++chd_fetch_sector(BDRVChdState *s, uint64_t lba, const uint8_t **sector,
++                 char *reason, size_t reason_len)
++{
++    ChdDecodeJob job = { .s = s, .lba = lba };
++    int ret = -EIO;
++
++    *sector = chd_disc_sector_cached(s->disc, lba);
++    if (*sector) {
++        s->hits++;
++        return 0;
++    }
++
++    for (int attempt = 0; attempt < 4; attempt++) {
++        s->jobs++;
++        ret = thread_pool_submit_co(chd_decode_job, &job);
++        if (ret == 0) {
++            *sector = job.sector;
++            return 0;
++        }
++        if (ret != -EAGAIN) {
++            break;
++        }
++        /* the job needed compressed bytes the window does not hold: read
++         * them here, where the block layer can be called, and try again */
++        s->retries++;
++        if (chd_file_fill(s->file, s->file->miss_pos, s->file->miss_len) < 0) {
++            snprintf(job.reason, sizeof(job.reason),
++                     "could not read the CHD file");
++            ret = -EIO;
++            break;
++        }
++    }
++    snprintf(reason, reason_len, "%s",
++             job.reason[0] ? job.reason : "CHD read failed");
++    return ret < 0 ? ret : -EIO;
++}
++
++static int coroutine_fn GRAPH_RDLOCK
++chd_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
++              QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVChdState *s = bs->opaque;
++    int64_t pos = offset;
++    size_t done = 0;
++    int ret = 0;
++    int64_t t0, dt;
++
++    assert(QEMU_IS_ALIGNED(offset, BDRV_SECTOR_SIZE));
++    assert(QEMU_IS_ALIGNED(bytes, BDRV_SECTOR_SIZE));
++
++    qemu_co_mutex_lock(&s->lock);
++    t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    while (pos < offset + bytes) {
++        uint64_t lba = pos / CHD_DISC_SECTOR_SIZE;
++        size_t skip = pos % CHD_DISC_SECTOR_SIZE;
++        size_t n = MIN(CHD_DISC_SECTOR_SIZE - skip, offset + bytes - pos);
++        char reason[128];
++        const uint8_t *sector;
++
++        ret = chd_fetch_sector(s, lba, &sector, reason, sizeof(reason));
++        if (ret < 0) {
++            error_report("CHD: %s", reason);
++            break;
++        }
++        qemu_iovec_from_buf(qiov, done, sector + skip, n);
++        pos += n;
++        done += n;
++    }
++
++    dt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
++    s->reads++;
++    s->bytes += done;
++    s->read_ns += dt;
++    s->read_max_ns = MAX(s->read_max_ns, dt);
++    if (dt > 10 * SCALE_MS) {
++        s->slow++;
++    }
++    qemu_co_mutex_unlock(&s->lock);
++    return ret;
++}
++
++static void chd_bdrv_close(BlockDriverState *bs)
++{
++    BDRVChdState *s = bs->opaque;
++
++    if (s->reads) {
++        /* in the session log of the core, with xemu's other messages */
++        info_report("CHD: %" PRIu64 " reads, %" PRIu64 " MiB; %" PRIu64
++                    " sectors from the cache, %" PRIu64 " hunks decoded on "
++                    "worker threads (%.0f ms, %" PRIu64 " sent again), %" PRIu64
++                    " window reads (%" PRIu64 " MiB of the file); a read "
++                    "took %.0f us on average and %.1f ms at most, %" PRIu64
++                    " over 10 ms",
++                    s->reads, s->bytes / MiB, s->hits, s->jobs,
++                    s->decode_ns / 1e6, s->retries,
++                    s->file ? s->file->refills : 0,
++                    s->file ? s->file->refill_bytes / MiB : 0,
++                    s->read_ns / 1e3 / s->reads, s->read_max_ns / 1e6,
++                    s->slow);
++    }
++    chd_disc_free(s->disc);
++    s->disc = NULL;
++    if (s->chd) {
++        chd_close(s->chd);
++        s->chd = NULL;
++        s->file = NULL;
++    }
++}
++
++static BlockDriver bdrv_chd = {
++    .format_name            = "chd",
++    .instance_size          = sizeof(BDRVChdState),
++    .bdrv_probe             = chd_probe,
++    .bdrv_open              = chd_bdrv_open,
++    .bdrv_child_perm        = bdrv_default_perms,
++    .bdrv_refresh_limits    = chd_refresh_limits,
++    .bdrv_co_preadv         = chd_co_preadv,
++    .bdrv_close             = chd_bdrv_close,
++    .is_format              = true,
++};
++
++static void bdrv_chd_init(void)
++{
++    bdrv_register(&bdrv_chd);
++}
++
++block_init(bdrv_chd_init);
+diff --git a/block/meson.build b/block/meson.build
+index 34b1b2a..695d0ab 100644
+--- a/block/meson.build
++++ b/block/meson.build
+@@ -41,6 +41,12 @@ block_ss.add(files(
+   'write-threshold.c',
+ ), zstd, zlib)
+ 
++# CHD disc images, read through libchdr
++block_ss.add(files(
++  'chd.c',
++  'chd-disc.c',
++), libchdr)
++
+ system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
+ system_ss.add(files('block-ram-registrar.c'))
+ 
+diff --git a/include/block/chd-disc.h b/include/block/chd-disc.h
+new file mode 100644
+index 0000000..ae1f6d2
+--- /dev/null
++++ b/include/block/chd-disc.h
+@@ -0,0 +1,95 @@
++/*
++ * CHD (MAME's Compressed Hunks of Data) disc images, read through libchdr.
++ *
++ * The layout code of block/chd.c, with nothing of QEMU's block layer in it, so
++ * that what runs before qemu_init (is this content an Xbox disc? where does
++ * its game partition start? which game is it?) can read a CHD as well. The
++ * block driver reads through its file child, this file's chd_disc_file_*
++ * through a plain path.
++ *
++ * An image's 2048-byte sectors are what a DVD drive hands the guest. Two kinds
++ * of CHD hold them:
++ *  - "createdvd": flat 2048-byte units, with the DVD metadata tag;
++ *  - "createcd": a CD, with one MODE1 (2048 bytes) or MODE1_RAW (2352 bytes,
++ *    the data 16 bytes in) track in 2448-byte frames, whatever its size.
++ * Pregaps, other track types, several tracks with audio and parent CHDs are
++ * not supported.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#ifndef BLOCK_CHD_DISC_H
++#define BLOCK_CHD_DISC_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define CHD_DISC_SECTOR_SIZE 2048
++
++/* libchdr's handle, without its header */
++struct _chd_file;
++
++typedef struct ChdDisc ChdDisc;
++
++/*
++ * The layout of the disc in an open CHD, which stays the caller's to close,
++ * after the disc. NULL when the CHD is not a disc this code reads, with the
++ * reason in err.
++ */
++ChdDisc *chd_disc_new(struct _chd_file *chd, char *err, size_t errlen);
++void chd_disc_free(ChdDisc *disc);
++
++/* Its size in 2048-byte sectors */
++uint64_t chd_disc_sectors(const ChdDisc *disc);
++
++/*
++ * The 2048 bytes of sector lba, decoded if its hunk is not among the 16 MiB
++ * of them that are kept; NULL on an error, with the reason in err. The bytes
++ * stay valid until a later call needs their place in the cache, so copy them
++ * out before the next one. This is where libchdr reads and decodes, and so
++ * where the time goes: it may run on any thread, as long as no two calls on a
++ * disc (or on its CHD) overlap.
++ */
++const uint8_t *chd_disc_sector(ChdDisc *disc, uint64_t lba,
++                               char *err, size_t errlen);
++
++/*
++ * The same for a sector whose hunk is already in the cache: NULL if it is not,
++ * with no reading and nothing decoded, so a caller can tell whether
++ * chd_disc_sector would take time.
++ */
++const uint8_t *chd_disc_sector_cached(ChdDisc *disc, uint64_t lba);
++
++/* Whether path names a CHD: ends in ".chd", in any case */
++bool chd_disc_path_is_chd(const char *path);
++
++/*
++ * A CHD opened by its path (a plain host path: not a saf:// or other URI that
++ * only the frontend's VFS reads), for reading the disc byte by byte.
++ */
++typedef struct ChdDiscFile ChdDiscFile;
++
++ChdDiscFile *chd_disc_file_open(const char *path);
++/* len bytes at offset of the disc; false when they are not all there */
++bool chd_disc_file_read(ChdDiscFile *file, uint64_t offset, void *buf,
++                        size_t len);
++void chd_disc_file_close(ChdDiscFile *file);
++
++#endif /* BLOCK_CHD_DISC_H */
+diff --git a/meson.build b/meson.build
+index cc049c3..f610785 100644
+--- a/meson.build
++++ b/meson.build
+@@ -4029,6 +4029,36 @@ if have_block
+     block_ss.add(files('replication.c'))
+   endif
+ 
++  # CHD disc images (block/chd.c, block/chd-disc.c): libchdr as a static CMake
++  # subproject, with the miniz, lzma and zstd it carries, so that no host needs
++  # them installed.
++  libchdr_opts = cmake.subproject_options()
++  libchdr_opts.add_cmake_defines({
++    'BUILD_SHARED_LIBS': 'OFF',
++    'WITH_SYSTEM_ZLIB': 'OFF',
++    'WITH_SYSTEM_ZSTD': 'OFF',
++    'INSTALL_STATIC_LIBS': 'OFF',
++  })
++  if host_os == 'darwin'
++    libchdr_opts.add_cmake_defines({'CMAKE_OSX_ARCHITECTURES': cmake_macos_arch})
++  endif
++  # the static library goes into a position-independent executable
++  if host_os != 'windows'
++    libchdr_opts.add_cmake_defines({'CMAKE_POSITION_INDEPENDENT_CODE': 'ON'})
++    libchdr_opts.set_override_option('b_staticpic', 'true')
++  endif
++  libchdr_sp = cmake.subproject('libchdr', options: libchdr_opts, required: true)
++  # libchdr's CMake keeps its codecs in libraries of their own, which the
++  # static library does not carry
++  libchdr = declare_dependency(
++    link_with: [
++      libchdr_sp.target('chdr-static'),
++      libchdr_sp.target('chdr-lzma'),
++      libchdr_sp.target('miniz'),
++      libchdr_sp.target('zstd'),
++    ],
++    include_directories: libchdr_sp.include_directories('chdr-static'))
++
+   subdir('nbd')
+   subdir('scsi')
+   subdir('block')
+diff --git a/subprojects/libchdr.wrap b/subprojects/libchdr.wrap
+new file mode 100644
+index 0000000..955e00d
+--- /dev/null
++++ b/subprojects/libchdr.wrap
+@@ -0,0 +1,4 @@
++[wrap-git]
++url = https://github.com/rtissera/libchdr
++revision = 7715de186a6798642ac81912b02667087fec2c2b
++depth = 1
+diff --git a/ui/xemu.c b/ui/xemu.c
+index 47bb0a9..2d586a9 100644
+--- a/ui/xemu.c
++++ b/ui/xemu.c
+@@ -28,6 +28,7 @@
+ /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
+ 
+ #include "qemu/osdep.h"
++#include "block/chd-disc.h"
+ #include "qemu/module.h"
+ #include "qemu/thread.h"
+ #include "qemu/main-loop.h"
+@@ -1458,8 +1459,11 @@ void xemu_load_disc(const char *path, Error **errp)
+     xbox_smc_eject_button();
+     xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
+ 
+-    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
+-                               false, 0, &error);
++    // A CHD (chdman's compressed image) is read by the chd driver; the boot
++    // drive has no format, so the block layer finds it there by its header
++    qmp_blockdev_change_medium("ide0-cd1", NULL, path,
++                               chd_disc_path_is_chd(path) ? "chd" : "raw",
++                               false, false, false, 0, &error);
+     if (error) {
+         error_propagate(errp, error);
+     } else {
+diff --git a/ui/xui/actions.cc b/ui/xui/actions.cc
+index 865b2eb..50602e7 100644
+--- a/ui/xui/actions.cc
++++ b/ui/xui/actions.cc
+@@ -38,7 +38,7 @@ void ActionEjectDisc(void)
+ void ActionLoadDisc(void)
+ {
+     static const SDL_DialogFileFilter filters[] = {
+-        { "Disc Image Files (*.iso, *.xiso)", "iso;xiso" },
++        { "Disc Image Files (*.iso, *.xiso, *.chd)", "iso;xiso;chd" },
+         { "All Files", "*" }
+     };
+     const char *default_path = g_config.sys.files.dvd_path;
+diff --git a/ui/xui/popup-menu.cc b/ui/xui/popup-menu.cc
+index 33de878..405a5c0 100644
+--- a/ui/xui/popup-menu.cc
++++ b/ui/xui/popup-menu.cc
+@@ -390,7 +390,8 @@ public:
+                 const auto &file_path = file.path();
+                 if (std::filesystem::is_regular_file(file_path) &&
+                     (file_path.extension() == ".iso" ||
+-                     file_path.extension() == ".xiso")) {
++                     file_path.extension() == ".xiso" ||
++                     file_path.extension() == ".chd")) {
+                     sorted_file_names.insert(
+                         { file_path.stem().string(), file_path.string() });
+                 }
+-- 
+2.43.0
+

@@ -7,25 +7,25 @@ name: Monthly standalone CHD build
 #
 #   1. master is made identical to xemu-project/xemu's master (and made, in a
 #      repository that has none yet: the first run pushes all of xemu's history);
-#   2. chd-support is made again: that master, with the pull request's current
-#      head merged into it (2809, CHD support, unless the run says another).
-#      It is made again, not merged forward as the libretro fork's is: the pull
-#      request is somebody else's, who may rebase or force-push it, and a branch
-#      that remade each month can not collect the debris of that;
-#   3. libchdr is linked into the block layer, if the pull request does not
-#      (it does not, at the time of writing: see the step of that name);
-#   4. chd-support is built for Windows x86_64, release, as upstream builds it
+#   2. chd-support is made again: that master, with the patches of the patches
+#      folder applied to it (the CHD support: a block driver for chdman's
+#      images, read on worker threads, and the loader and file dialog taking
+#      .chd). It is made again, not merged forward: a patch put on a fresh
+#      master can not collect the debris of earlier months, and one that has
+#      stopped applying says so at once;
+#   3. chd-support is built for Windows x86_64, release, as upstream builds it
 #      (build-windows.yml), and the build is the run's artifact.
 #
-# This file lives on a branch of its own, which has to be the repository's
-# default branch (scheduled workflows run from there only): step 1 would delete
-# it from master, and step 2 from chd-support. Make it so, in a new empty
-# repository on GitHub (no README, no licence), whose default branch will be
-# the first one pushed:
+# This file and the patches folder live on a branch of their own, which has to
+# be the repository's default branch (scheduled workflows run from there only):
+# step 1 would delete them from master, and step 2 from chd-support. Make it so,
+# in a new empty repository on GitHub (no README, no licence), whose default
+# branch will be the first one pushed:
 #
-#   git init -b automation && mkdir -p .github/workflows
+#   git init -b automation && mkdir -p .github/workflows patches
 #   cp <this file> .github/workflows/monthly-chd-build.yml
-#   git add .github && git commit -m "Monthly CHD build [skip ci]"
+#   cp <the patch> patches/
+#   git add .github patches && git commit -m "Monthly CHD build [skip ci]"
 #   git remote add origin https://github.com/<you>/<repository>.git
 #   git push -u origin automation
 #
@@ -34,24 +34,20 @@ name: Monthly standalone CHD build
 #
 # Also needed once: a personal access token in the secret SYNC_TOKEN (Settings >
 # Secrets and variables > Actions), as the job's own token may not push a commit
-# that changes .github/workflows, which a merge of master does sooner or later.
-# A fine-grained token for this repository, with Contents and Workflows set to
-# Read and write, is enough.
+# that changes .github/workflows, which a master of upstream does sooner or
+# later. A fine-grained token for this repository, with Contents and Workflows
+# set to Read and write, is enough.
 #
-# A pull request that does not merge into master stops the job, with the files
-# in the run's summary, and GitHub mails the failed run. The commits of
-# chd-support end in [skip ci], so that upstream's own CI (every platform and
-# its tests, which it runs on every push to a branch) does not start on them.
+# A patch that does not apply to master stops the job, with the files in the
+# run's summary, and GitHub mails the failed run. The commits of chd-support end
+# in [skip ci], so that upstream's own CI (every platform and its tests, which
+# it runs on every push to a branch) does not start on them.
 
 on:
   schedule:
     - cron: '23 4 1 * *'
   workflow_dispatch:
     inputs:
-      pr:
-        description: 'Number of the xemu pull request to build on top of master'
-        type: string
-        default: '2809'
       build:
         description: 'Build chd-support after making it'
         type: boolean
@@ -69,6 +65,7 @@ env:
   UPSTREAM_BRANCH: master
   MIRROR_BRANCH: master
   FEATURE_BRANCH: chd-support
+  PATCH_DIR: patches
   # Where upstream's Windows build gets its image from, and the image to use if
   # that line is not found there any more
   IMAGE_FILE: .github/workflows/build-windows.yml
@@ -96,15 +93,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
-      - name: Fetch upstream and the pull request
-        env:
-          PR: ${{ inputs.pr || '2809' }}
+      - name: Fetch upstream
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
-          git fetch --no-tags upstream "+refs/pull/${PR}/head:refs/remotes/upstream/pr-${PR}"
 
       - name: Make the mirror branch identical to upstream
         run: |
@@ -135,88 +129,40 @@ jobs:
             echo "${MIRROR_BRANCH} did not exist: made at \`${up:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Make the feature branch again, from master and the pull request
-        env:
-          PR: ${{ inputs.pr || '2809' }}
+      - name: Make the feature branch again, from master and the patches
         run: |
+          shopt -s nullglob
+          found=("${PATCH_DIR}"/*.patch)
+          if [ "${#found[@]}" = 0 ]; then
+            echo "::error title=No patches::There is no *.patch file in ${PATCH_DIR}/ of the default branch."
+            exit 1
+          fi
+          # the checkout below replaces the working tree, and the patches with it
+          rm -rf "${RUNNER_TEMP}/patches" && mkdir -p "${RUNNER_TEMP}/patches"
+          cp "${found[@]}" "${RUNNER_TEMP}/patches/"
+
           up=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
-          pr=$(git rev-parse "upstream/pr-${PR}")
           git checkout -q -B "${FEATURE_BRANCH}" "$up"
           echo "### ${FEATURE_BRANCH}" >> "$GITHUB_STEP_SUMMARY"
-          if git merge-base --is-ancestor "$pr" HEAD; then
-            # already in master (merged upstream since): the branch is master
-            git commit -q --allow-empty -m "${FEATURE_BRANCH}: master ${up:0:10}, which has pull request ${PR} (${pr:0:10}) already [skip ci]"
-            echo "Pull request ${PR} (\`${pr:0:10}\`) is in master already: ${FEATURE_BRANCH} is master \`${up:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
-          elif git merge --no-ff -m "${FEATURE_BRANCH}: master ${up:0:10} with pull request ${PR} (${pr:0:10}) [skip ci]" "$pr"; then
-            echo "Master \`${up:0:10}\` with pull request ${PR} \`${pr:0:10}\` merged: \`$(git rev-parse --short HEAD)\`." >> "$GITHUB_STEP_SUMMARY"
+          # --3way: upstream may have moved a little around what a patch changes;
+          # --empty=drop: a patch that upstream has taken in since is nothing to apply
+          if git am --3way --empty=drop "${RUNNER_TEMP}"/patches/*.patch; then
+            echo "Master \`${up:0:10}\` with ${#found[@]} patch file(s): $(git rev-list --count "$up..HEAD") commit(s) on top." >> "$GITHUB_STEP_SUMMARY"
           else
             files=$(git diff --name-only --diff-filter=U)
-            git merge --abort
+            git am --abort
             {
-              echo "**Pull request ${PR} (\`${pr:0:10}\`) does not merge into master \`${up:0:10}\`**: conflicts in"
+              echo "**The patches do not apply to master \`${up:0:10}\`**: conflicts in"
               echo '```'
               echo "$files"
               echo '```'
               echo "${FEATURE_BRANCH} was left as it was."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=Pull request ${PR} does not merge into master::Conflicts in: $(echo "$files" | tr '\n' ' ')"
+            echo "::error title=The patches do not apply to master::Conflicts in: $(echo "$files" | tr '\n' ' ')"
             exit 1
           fi
-
-      # The pull request defines libchdr in meson.build and never links it into
-      # the block layer, so chd.c finds neither its header nor its library; its
-      # CMake options use the system zlib, which leaves out the miniz library
-      # that is linked here; and libchdr's codecs (lzma, miniz, zstd) are
-      # libraries of their own, which the static library does not carry. Each
-      # repair is made only if the pull request does not have it, so that a pull
-      # request that is fixed is taken as it is. Take this step out when it is.
-      - name: Link libchdr into the block layer
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          mb = pathlib.Path("meson.build")
-          bm = pathlib.Path("block/meson.build")
-          done = []
-
-          text = mb.read_text()
-          if "libchdr_sp" not in text:
-              # not the CHD pull request (the run was given another): nothing to link
-              print("the pull request does not use libchdr: nothing to repair")
-              raise SystemExit
-          if "'WITH_SYSTEM_ZLIB': 'ON'" in text:
-              text = text.replace("'WITH_SYSTEM_ZLIB': 'ON'", "'WITH_SYSTEM_ZLIB': 'OFF'")
-              done.append("WITH_SYSTEM_ZLIB off")
-          old = "libchdr = libchdr_sp.dependency('chdr-static')"
-          if old in text and "chdr-lzma" not in text:
-              new = ("# libchdr's CMake keeps its codecs in libraries of their own, which the\n"
-                     "  # static library does not carry\n"
-                     "  libchdr = declare_dependency(\n"
-                     "    link_with: [\n"
-                     "      libchdr_sp.target('chdr-static'),\n"
-                     "      libchdr_sp.target('chdr-lzma'),\n"
-                     "      libchdr_sp.target('miniz'),\n"
-                     "      libchdr_sp.target('zstd'),\n"
-                     "    ],\n"
-                     "    include_directories: libchdr_sp.include_directories('chdr-static'))")
-              text = text.replace(old, new)
-              done.append("libchdr dependency lists its targets")
-          mb.write_text(text)
-
-          b = bm.read_text()
-          if "libchdr" not in b:
-              if not b.endswith("\n"):
-                  b += "\n"
-              bm.write_text(b + "\n# CHD images need libchdr\nblock_ss.add(libchdr)\n")
-              done.append("block_ss links libchdr")
-
-          print("; ".join(done) if done else "nothing to repair")
-          PY
-          if git diff --quiet; then
-            echo "libchdr: the pull request links it already, nothing was repaired." >> "$GITHUB_STEP_SUMMARY"
-          else
-            git commit -q -am "${FEATURE_BRANCH}: link libchdr into the block layer [skip ci]"
-            echo "libchdr was not linked by the pull request: repaired in \`$(git rev-parse --short HEAD)\` (meson.build, block/meson.build)." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # the last commit is the one that upstream's CI looks at: skip it
+          git commit -q --allow-empty -m "${FEATURE_BRANCH}: master ${up:0:10} with the patches of ${PATCH_DIR}/ [skip ci]"
 
       - name: Push the feature branch
         run: git push --force origin "HEAD:refs/heads/${FEATURE_BRANCH}"
@@ -263,7 +209,7 @@ jobs:
       - name: Mark the checkout safe for git, and fetch upstream's tags
         run: |
           git config --global --add safe.directory '*'
-          # for the version string (git describe): the fork has no tags of its own
+          # for the version string (git describe): the repository has no tags of its own
           git fetch --no-recurse-submodules "https://github.com/${UPSTREAM_REPO}.git" 'refs/tags/v*:refs/tags/v*'
 
       # As upstream's release build, without the compiler cache its incremental
@@ -277,7 +223,7 @@ jobs:
             echo "### Build"
             echo "xemu \`$(git describe --tags --match 'v*' 2>/dev/null || echo unknown)\`, commit \`$(git rev-parse --short HEAD)\`"
             echo
-            echo "The artifact is \`dist\`: xemu.exe, to be run with the usual BIOS files. Its CHD support is the pull request's: a CHD made with \`chdman createcd\`."
+            echo "The artifact is \`dist\`: xemu.exe, to be run with the usual BIOS files. It loads a CHD made with \`chdman createdvd\` or \`createcd\`; like any xemu, it needs the image in XISO form (the game partition alone, not a full Redump image)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
